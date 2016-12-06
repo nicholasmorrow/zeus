@@ -1,6 +1,7 @@
 import can
 import logging
-
+from time import sleep
+from colorama import init, Fore, Back, Style
 
 class ContainerGeometry(object):
 
@@ -71,6 +72,25 @@ class LiquidClass(object):
         self.flowRateTransportVolume = flowRateTransportVolume
 
 
+class remoteFrameListener(can.Listener):
+
+    def __init__(self, p):
+        self.parent = p
+        self.flag = 0
+
+    def on_message_received(self, msg):
+        #print(Fore.RED + "Received message:")
+        print(Fore.RED + self.parent.parseErrors(msg.data))
+        print Style.RESET_ALL
+
+    def remote_received(self):
+        if(self.flag == 1):
+            self.flag = 0
+            return 1
+        else:
+            return 0
+
+
 def split_by_n(seq, n):
     """A generator to divide a sequence into chunks of n units."""
     while seq:
@@ -125,7 +145,9 @@ class ZeusModule(object):
     }
 
     def __init__(self, id=None):
-        # self.initCANBus()
+        #colorama.init()
+        init()
+        self.initCANBus()
         if id is None:
             raise ValueError(
                 "Cannot initialize ZeusModule instance with unspecified id.")
@@ -137,6 +159,8 @@ class ZeusModule(object):
         self.pos = 0
         self.minZPosition = 0
         self.maxZPosition = 1800
+        self.r = remoteFrameListener(self)
+        self.remoteFrameNotifier = can.Notifier(self.CANBus, [self.r])
         # print("ZeusModule {}: initializing...".format(self.id))
         logging.info("ZeusModule {}: initializing...".format(self.id))
         self.initZDrive()
@@ -153,30 +177,70 @@ class ZeusModule(object):
         return identifier
 
     def sendCommand(self, cmd):
+
+        print("ZeusModule {}: sending data frame(s)...")
         data = list(split_by_n(cmd, 7))
         byte = 0
         cmd_len = len(data)
         for i in range(0, cmd_len):
-            msg = can.Message(
-                extended_id=False,
-                arbitration_id=self.assembleIdentifier('data'),
-                data=data[i])
-            # Assemble the 8th (status) byte
-            if (i == (range(0, cmd_len - 1))):
-                # Add EOM bit
-                byte |= 1 << 7
-            # Add number of data bytes
-            byte |= len(data[i]) << 4
-            byte |= ((i + 1) % 31)
-            msg.data.append(byte)
-            print("{}".format(msg))
+            n = 0
+            while (n < 10):
+                # SEND KICK FRAME
+                print("ZeusModule {}: sending kick frame...")
+                msg = can.Message(
+                    extended_id=False,
+                        arbitration_id=self.assembleIdentifier('kick'),
+                        data=0
+                )
+                print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
+                try:
+                    self.CANBus.send(msg)
+                except can.canError:
+                    print(Fore.RED + "ERROR: Kick not sent!" + Style.RESET_ALL)
+                # WAIT FOR REMOTE RESPONSE
+                sleep(0.05)
+                if(self.r.remote_received() == 1):
+                    n = 10
+                else:
+                    n += 1
+
+            n =0
+            while (n < 10):
+                # SEND DATA FRAME
+                msg = can.Message(
+                    extended_id=False,
+                    arbitration_id=self.assembleIdentifier('data'),
+                    data=data[i])
+                # Assemble the 8th (status) byte
+                if (i == (range(0, cmd_len - 1))):
+                    # Add EOM bit
+                    byte |= 1 << 7
+                # Add number of data bytes
+                byte |= len(data[i]) << 4
+                byte |= ((i + 1) % 31)
+                msg.data.append(byte)
+                print("{}".format(msg))
+                try:
+                    self.CANBus.send(msg)
+        #          print("Message")
+                except can.canError:
+                    print("ERROR: Message not sent!")
+
+                # WAIT FOR REMOTE RESPONSE
+                sleep(0.05)
+                if(self.r.remote_received() == 1):
+                    n = 10
+                else:
+                    n += 1
 
     def initCANBus(self):
         print("ZeusModule {}: initializing CANBus...")
         logging.info("ZeusModule {}: initializing CANBus...")
-        can.rc['interface'] = 'socketcan'
-        can.rc['channel'] = 'vcan0'
-        CANBus = can.interface.Bus()
+        can.rc['interface'] = 'socketcan_ctypes'
+        can.rc['channel'] = 'can0'
+        self.CANBus = can.interface.Bus()
+        # self.remoteFrameListener = can.Listener()
+        # self.remoteFrameNotifier = can.Notifier(self.CANBus, [self.r])
 
     def initDosingDrive(self):
         cmd = self.cmdHeader('DI')
