@@ -1,7 +1,28 @@
 import can
 import logging
+import signal
+import time
 from time import sleep
 from colorama import init, Fore, Back, Style
+
+DEBUG = 0
+INFO = 1
+WARNING = 1
+ERROR = 1
+
+def printMSG(type, msg):
+    if (type == 'info' and INFO == 1):
+        print(Fore.WHITE + "INFO: " + msg + Style.RESET_ALL)
+
+    elif (type == 'debug' and DEBUG == 1):
+        print(Fore.MAGENTA + "DEBUG: " + msg + Style.RESET_ALL)
+
+    elif (type == 'warning' and WARNING == 1):
+        print(Fore.YELLOW + "WARNING: " + msg + Style.RESET_ALL)
+
+    elif (type == 'error' and ERROR == 1):
+        print(Fore.RED + "ERROR: " + msg + Style.RESET_ALL)
+
 
 class ContainerGeometry(object):
 
@@ -79,9 +100,20 @@ class remoteFrameListener(can.Listener):
         self.flag = 0
 
     def on_message_received(self, msg):
-        #print(Fore.RED + "Received message:")
-        print(Fore.RED + self.parent.parseErrors(msg.data))
-        print Style.RESET_ALL
+        if(msg.is_remote_frame == True):
+            print(Fore.BLUE + "Received remote frame with DLC={}.".format(
+                msg.dlc) + Style.RESET_ALL)
+            self.flag = 1
+        elif(msg.dlc == 0):
+            print(Fore.BLUE + "Received kick with DLC=0.".format(
+                msg.dlc) + Style.RESET_ALL)
+            printMSG('info', "Sending remote frame.")
+            self.parent.sendRemoteFrame()
+        else:
+            print(Fore.BLUE + "{}".format(msg) + Style.RESET_ALL)
+            ret = self.parent.parseErrors(msg.data)
+            if(ret):
+                print(Fore.RED + ret + Style.RESET_ALL)
 
     def remote_received(self):
         if(self.flag == 1):
@@ -101,6 +133,7 @@ def split_by_n(seq, n):
 class ZeusModule(object):
     CANBus = None
     transmission_retries = 10
+    remote_timeout = 0.1
     errorTable = {
         "20": "No communication to EEPROM.",
             "30": "Undefined command.",
@@ -145,9 +178,9 @@ class ZeusModule(object):
     }
 
     def __init__(self, id=None):
-        #colorama.init()
+        # colorama.init()
         init()
-        self.initCANBus()
+        self.id = id
         if id is None:
             raise ValueError(
                 "Cannot initialize ZeusModule instance with unspecified id.")
@@ -155,7 +188,7 @@ class ZeusModule(object):
             raise ValueError(
                 "Cannot initialize ZeusModule instance with out of range id."
                 " Valid id range is [1-31]")
-        self.id = id
+        self.initCANBus()
         self.pos = 0
         self.minZPosition = 0
         self.maxZPosition = 1800
@@ -167,7 +200,7 @@ class ZeusModule(object):
         self.initDosingDrive()
 
     def cmdHeader(self, command):
-        return command + str(self.id).zfill(4)
+        return command + "id" + str(self.id).zfill(4)
 
     def assembleIdentifier(self, msg_type, master_id=0):
         identifier = (0 | self.id)
@@ -175,63 +208,135 @@ class ZeusModule(object):
         if msg_type is 'kick':
             identifier |= 1 << 10
         return identifier
+    
+    def sendRemoteFrame(self):
+            # SEND REMOTE FRAME
+            msg = can.Message(
+                extended_id=False,
+                is_remote_frame=True,
+                    arbitration_id=self.assembleIdentifier('kick')
+            )
+            print(
+                "INFO: ZeusModule {}: sending remote frame...".format(self.id))
+            print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
+            try:
+                self.CANBus.send(msg)
+            except can.canError:
+                print(Fore.RED + "ERROR: Remote frame not sent!" + Style.RESET_ALL)
+                # WAIT FOR REMOTE RESPONSE
+                #  sleep(self.remote_timeout)
+                #  s = time.time()
+                #  c = time.time()
+                # LOOP HERE UNTIL TIMEOUT EXPIRES
+                #  while ((c - s) < self.remote_timeout):
+                    #  c = time.time()
+                    #  if(self.r.remote_received() == 1):
+                        #  print(
+                            #  Fore.MAGENTA + "DEBUG: ACK Received." +
+                            #  Style.RESET_ALL)
+                        #  n = self.transmission_retries
+                #  if(n < self.transmission_retries):
+                    #  printMSG("warning", "Timeout waiting for kick response. Issuing retry {} of {}".format(
+                        #  n + 1, self.transmission_retries))
 
+                #  n += 1
+    
     def sendCommand(self, cmd):
-
-        print("ZeusModule {}: sending data frame(s)...")
         data = list(split_by_n(cmd, 7))
-        byte = 0
         cmd_len = len(data)
+        print(
+            "INFO: ZeusModule {}: sending packet {} in {} data frame(s)...".format(self.id, cmd, cmd_len))
         for i in range(0, cmd_len):
             n = 0
-            while (n < 10):
-                # SEND KICK FRAME
-                print("ZeusModule {}: sending kick frame...")
+            byte = 0
+            # RETRY UP TO 10 TIMES
+            # SEND KICK FRAME
+            while (n < self.transmission_retries):
                 msg = can.Message(
                     extended_id=False,
                         arbitration_id=self.assembleIdentifier('kick'),
                         data=0
                 )
+                print(
+                    "INFO: ZeusModule {}: sending kick frame...".format(self.id))
                 print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
                 try:
                     self.CANBus.send(msg)
                 except can.canError:
                     print(Fore.RED + "ERROR: Kick not sent!" + Style.RESET_ALL)
                 # WAIT FOR REMOTE RESPONSE
-                sleep(0.05)
-                if(self.r.remote_received() == 1):
-                    n = 10
-                else:
-                    n += 1
+                sleep(self.remote_timeout)
+                s = time.time()
+                c = time.time()
+                # LOOP HERE UNTIL TIMEOUT EXPIRES
+                while ((c - s) < self.remote_timeout):
+                    c = time.time()
+                    if(self.r.remote_received() == 1):
+                        #  print(
+                            # Fore.MAGENTA + "DEBUG: ACK Received." +
+                            # Style.RESET_ALL)
+                        n = self.transmission_retries
+                if(n < self.transmission_retries):
+                    printMSG("warning", "Timeout waiting for kick response. Issuing retry {} of {}".format(
+                        n + 1, self.transmission_retries))
 
-            n =0
+                n += 1
+            #  print(
+                # Fore.MAGENTA + "DEBUG: Jumped out of while loop." +
+                # Style.RESET_ALL)
+
+            n = 0
             while (n < 10):
                 # SEND DATA FRAME
+                string_length = len(data[i])
+                outstring = bytearray(data[i])
+                # print("INFO: ZeusModule {}: sending data frame {} of
+                # {}...".format(self.id, i+1, cmd_len))
+                #  print(Fore.MAGENTA + "DEBUG: data pre append = {}".format(
+                    #  outstring) + Style.RESET_ALL)
+                printMSG('debug', "data pre append = {}".format(outstring))
+                # Assemble the 8th (status) byte
+                if (i == (cmd_len - 1)):
+                    # Add EOM bit
+                    printMSG("debug","appending EOM bit to byte")
+                    byte |= 1 << 7
+                # Add number of data bytes
+                #byte |= (len(data[i]) << 4)
+                byte |= (string_length << 4)
+                printMSG("debug","num data bytes = {}".format(len(data[i])))
+                byte |= ((i + 1) % 31)
+                printMSG("debug","byte counter = {}".format(((i + 1) % 31)))
+                printMSG("debug","byte = {0:b}".format(byte))
+                outstring.append(byte)
+                printMSG("debug","date post append = {}".format(outstring))
                 msg = can.Message(
                     extended_id=False,
                     arbitration_id=self.assembleIdentifier('data'),
-                    data=data[i])
-                # Assemble the 8th (status) byte
-                if (i == (range(0, cmd_len - 1))):
-                    # Add EOM bit
-                    byte |= 1 << 7
-                # Add number of data bytes
-                byte |= len(data[i]) << 4
-                byte |= ((i + 1) % 31)
-                msg.data.append(byte)
-                print("{}".format(msg))
+                    data=outstring)
+                print("info","ZeusModule {}: sending data frame {} of {}...".format(self.id, i + 1, cmd_len))
+                print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
                 try:
                     self.CANBus.send(msg)
         #          print("Message")
                 except can.canError:
-                    print("ERROR: Message not sent!")
+                    printMSG("error","Message not sent!")
 
                 # WAIT FOR REMOTE RESPONSE
-                sleep(0.05)
-                if(self.r.remote_received() == 1):
-                    n = 10
-                else:
-                    n += 1
+                s = time.time()
+                c = time.time()
+                # LOOP HERE UNTIL TIMEOUT EXPIRES
+                while ((c - s) < self.remote_timeout):
+                    c = time.time()
+                    if(self.r.remote_received() == 1):
+                        #  print(
+                            # Fore.MAGENTA + "DEBUG: ACK Received." +
+                            # Style.RESET_ALL)
+                        n = self.transmission_retries
+                if(n < self.transmission_retries):
+                    print (Fore.YELLOW + "WARNING: Timeout waiting for kick response. Issuing retry {} of {}".format(
+                        n + 1, self.transmission_retries) + Style.RESET_ALL)
+
+                n += 1
 
     def initCANBus(self):
         print("ZeusModule {}: initializing CANBus...")
@@ -287,6 +392,10 @@ class ZeusModule(object):
         cmd = self.cmdHeader('GU')
         cmd = cmd + 'go' + str(deckGeometryTableIndex).zfill(2)
         self.sendCommand(cmd)
+
+    def sendString(self, string):
+        #cmd = self.cmdHeader(string)
+        self.sendCommand(string)
 
     def aspiration(self, aspirationVolume=0, containerGeometryTableIndex=0,
                    deckGeometryTableIndex=0, liquidClassTableIndex=0, qpm=0,
@@ -351,8 +460,9 @@ class ZeusModule(object):
         self.sendCommand(cmd)
 
     def getFirmwareVersion(self):
-        cmd = self.cmdHeader('RF')
-        self.sendCommand(cmd)
+        #cmd = self.cmdHeader('RF')
+        self.sendCommand("RFid001")
+        #self.sendCommand(cmd)
 
     def getParameterValue(self, parameterName):
         if (len(parameterName) > 2):
@@ -531,10 +641,26 @@ class ZeusModule(object):
         pass
 
     def parseErrors(self, errorString):
+        #  print(Fore.MAGENTA + "DEBUG: ErrorString = {}".format(errorString))
+        #  if len(errorString.replace(" ", "")) == 0:
+            #  return
+        if errorString == "":
+            return
+
+        #  else:
+            # print(Fore.MAGENTA + "DEBUG: Received error string '{}' with
+            # length: {}".format(errorString, len(errorString.replace(" ",
+            # ""))) + Style.RESET_ALL)
+
         cmd = str(errorString[:2])
         # print("cmd = {}".format(cmd))
         eidx = errorString.find("er")
-        ec = errorString[(eidx + 2): (eidx + 4)]
+        ec = str(errorString[(eidx + 3): (eidx + 5)])
+        if ec == '00':
+            # NO ERROR
+            return
+        #  print(Fore.MAGENTA + "DEBUG: ec = {}".format(ec))
+
         defaultError = "Unknown error code returned."
         if cmd == 'DI':
             if ec in set(['00', '30', '35', '36', '40', '50', '52']):
@@ -699,4 +825,4 @@ class ZeusModule(object):
             else:
                 return defaultError
         else:
-            return "Error code returned corresponds to unknown command."
+            return "Error code returned '{}' corresponds to unknown command.".format(errorString)
