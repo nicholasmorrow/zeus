@@ -9,6 +9,11 @@ DEBUG = 0
 INFO = 1
 WARNING = 1
 ERROR = 1
+KICK_MASK = 0x0400
+SENDER_ID_MASK = 0x03E0
+RECEIVER_ID_MASK = 0x001F
+EOM_MASK = 0x0080
+
 
 def printMSG(type, msg):
     if (type == 'info' and INFO == 1):
@@ -22,6 +27,7 @@ def printMSG(type, msg):
 
     elif (type == 'error' and ERROR == 1):
         print(Fore.RED + "ERROR: " + msg + Style.RESET_ALL)
+        raise Exception(msg)
 
 
 class ContainerGeometry(object):
@@ -97,30 +103,105 @@ class remoteFrameListener(can.Listener):
 
     def __init__(self, p):
         self.parent = p
-        self.flag = 0
+        self.remote_flag = 0
+        self.kick_flag = 0
+        self.data_flag = 0
+        self.msg = ""
+        self.msg_complete_flag = 0
 
     def on_message_received(self, msg):
+        # Ignore the messages that we've sent out
+        #  printMSG(
+            #  "debug", "Rcvd msg with id = {}, sender id = {}, receiver id = {}, dlc = {}, rmt = {}".format(msg.arbitration_id,
+                                                                                                          #  (msg.arbitration_id &
+                                                                                                           #  SENDER_ID_MASK),
+                                                                                                          #  (msg.arbitration_id &
+                                                                                                           #  RECEIVER_ID_MASK),
+                                                                                                          #  msg.dlc, msg.is_remote_frame))
+        #  print(msg)
+        #  if(((msg.arbitration_id & SENDER_ID_MASK) == 0) or (msg.arbitration_id == 401)):
+            #  printMSG("debug", "Ignoring previous message.")
+            #  return
+            # Handle received remote frames
+        if(msg.arbitration_id == 0x0401):
+            return
+        #  if(msg.arbitration_id == self.parent.id):
+            #  return
+
         if(msg.is_remote_frame == True):
-            print(Fore.BLUE + "Received remote frame with DLC={}.".format(
-                msg.dlc) + Style.RESET_ALL)
-            self.flag = 1
-        elif(msg.dlc == 0):
-            print(Fore.BLUE + "Received kick with DLC=0.".format(
-                msg.dlc) + Style.RESET_ALL)
-            printMSG('info', "Sending remote frame.")
-            self.parent.sendRemoteFrame()
+            if((msg.arbitration_id == 0x0000) or (msg.arbitration_id == 0x0020)):
+                return
+            if(self.remote_flag == 0):
+                self.remote_flag = 1
+                printMSG("info", "Received remote frame with ID = {}, DLC = {}.".format(
+                    hex(msg.arbitration_id), msg.dlc))
+                print(Fore.BLUE + "{}".format(msg) + Style.RESET_ALL)
+            return
+
+        # elif((msg.arbitration_id & KICK_MASK) > 0):
+        elif(msg.arbitration_id == 0x0420):
+            if(self.kick_flag == 0):
+                printMSG("info", "Received Kick.")
+                #  print(Fore.BLUE + "Received kick with masked ID = {}.".format(
+                    #  (msg.arbitration_id & SENDER_ID_MASK)) + Style.RESET_ALL)
+                print(Fore.BLUE + "{}".format(msg) + Style.RESET_ALL)
+                self.kick_flag = 1
+                printMSG('info', "Sending remote frame.")
+                if self.parent.auto_response:
+                    self.parent.sendRemoteFrame(1)
+            return
+
         else:
+            if(self.msg_complete_flag == 1):
+                self.msg = ""
+
+            self.msg += msg.data
+            printMSG(
+                "info", "Response received with ID = {}.".format(msg.arbitration_id))
             print(Fore.BLUE + "{}".format(msg) + Style.RESET_ALL)
-            ret = self.parent.parseErrors(msg.data)
-            if(ret):
-                print(Fore.RED + ret + Style.RESET_ALL)
+            if(self.msg_is_last(msg) == 0):
+                if self.parent.auto_repsonse:
+                    self.parent.sendRemoteFrame(8)
+            else:
+                self.msg_complete_flag = 1
+                if self.parent.auto_response:
+                    self.parent.sendRemoteFrame(8)
+
+                ret = self.parent.parseErrors(msg.data)
+                if(ret != "NONE"):
+                    return ret
 
     def remote_received(self):
-        if(self.flag == 1):
-            self.flag = 0
+        if(self.remote_flag == 1):
+            self.remote_flag = 0
             return 1
         else:
             return 0
+
+    def kick_received(self):
+        if(self.kick_flag == 1):
+            self.kick_flag = 0
+            return 1
+        else:
+            return 0
+
+    def data_received(self):
+        if(self.data_flag == 1):
+            self.data_flag = 0
+            return 1
+        else:
+            return 0
+
+    def msg_is_last(self, msg):
+        size = len(msg.data)
+        if(size > 0):
+            #  printMSG(
+                #  "warning", "control byte length = {}".format(len(msg.data)))
+            control_byte = msg.data[(len(msg.data) - 1)]
+            if((control_byte & EOM_MASK) > 0):
+                return 1
+
+        return 0
 
 
 def split_by_n(seq, n):
@@ -132,8 +213,8 @@ def split_by_n(seq, n):
 
 class ZeusModule(object):
     CANBus = None
-    transmission_retries = 10
-    remote_timeout = 0.1
+    transmission_retries = 1
+    remote_timeout = 0.5
     errorTable = {
         "20": "No communication to EEPROM.",
             "30": "Undefined command.",
@@ -177,10 +258,11 @@ class ZeusModule(object):
             "85": "No communication to the digital potentiometer.",
     }
 
-    def __init__(self, id=None):
+    def __init__(self, id=None, init_module=True, auto_response=True):
         # colorama.init()
         init()
         self.id = id
+        self.auto_response = auto_response
         if id is None:
             raise ValueError(
                 "Cannot initialize ZeusModule instance with unspecified id.")
@@ -196,8 +278,12 @@ class ZeusModule(object):
         self.remoteFrameNotifier = can.Notifier(self.CANBus, [self.r])
         # print("ZeusModule {}: initializing...".format(self.id))
         logging.info("ZeusModule {}: initializing...".format(self.id))
-        self.initZDrive()
-        self.initDosingDrive()
+        if init_module:
+            self.initZDrive()
+            self.initDosingDrive()
+
+    def setAutoResponse(self, auto):
+        self.auto_response = auto
 
     def cmdHeader(self, command):
         return command + "id" + str(self.id).zfill(4)
@@ -208,133 +294,159 @@ class ZeusModule(object):
         if msg_type is 'kick':
             identifier |= 1 << 10
         return identifier
-    
-    def sendRemoteFrame(self):
+
+    def sendRemoteFrame(self, dlc):
             # SEND REMOTE FRAME
-            msg = can.Message(
-                extended_id=False,
-                is_remote_frame=True,
-                    arbitration_id=self.assembleIdentifier('kick')
-            )
+        msg = can.Message(
+            extended_id=False,
+            is_remote_frame=True,
+              arbitration_id=20)
+        for i in range(0, dlc):
+            msg.data.append("0")
+        msg.dlc = dlc
+        msg.arbitration_id = (0x0020)
+        print(
+            "INFO: ZeusModule {}: sending remote frame with dlc = {}...".format(self.id, msg.dlc))
+        print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
+        try:
+            self.CANBus.send(msg)
+        except can.canError:
             print(
-                "INFO: ZeusModule {}: sending remote frame...".format(self.id))
-            print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
+                Fore.RED + "ERROR: Remote frame not sent!" + Style.RESET_ALL)
+            # WAIT FOR REMOTE RESPONSE
+            #  sleep(self.remote_timeout)
+            #  s = time.time()
+            #  c = time.time()
+            # LOOP HERE UNTIL TIMEOUT EXPIRES
+            #  while ((c - s) < self.remote_timeout):
+                #  c = time.time()
+                #  if(self.r.remote_received() == 1):
+                    #  print(
+                        #  Fore.MAGENTA + "DEBUG: ACK Received." +
+                        #  Style.RESET_ALL)
+                    #  n = self.transmission_retries
+            #  if(n < self.transmission_retries):
+                #  printMSG("warning", "Timeout waiting for kick response. Issuing retry {} of {}".format(
+                    #  n + 1, self.transmission_retries))
+
+            #  n += 1
+
+    def sendKickFrame(self):
+        n = 0
+        msg = can.Message(
+            extended_id=False,
+                arbitration_id=self.assembleIdentifier('kick'),
+                data=0
+        )
+        print(
+            "INFO: ZeusModule {}: sending kick frame...".format(self.id))
+        print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
+        while (n < self.transmission_retries):
             try:
                 self.CANBus.send(msg)
             except can.canError:
-                print(Fore.RED + "ERROR: Remote frame not sent!" + Style.RESET_ALL)
-                # WAIT FOR REMOTE RESPONSE
-                #  sleep(self.remote_timeout)
-                #  s = time.time()
-                #  c = time.time()
-                # LOOP HERE UNTIL TIMEOUT EXPIRES
-                #  while ((c - s) < self.remote_timeout):
-                    #  c = time.time()
-                    #  if(self.r.remote_received() == 1):
-                        #  print(
-                            #  Fore.MAGENTA + "DEBUG: ACK Received." +
-                            #  Style.RESET_ALL)
-                        #  n = self.transmission_retries
-                #  if(n < self.transmission_retries):
-                    #  printMSG("warning", "Timeout waiting for kick response. Issuing retry {} of {}".format(
-                        #  n + 1, self.transmission_retries))
+                printMSG("error", "Kick not sent!")
 
-                #  n += 1
-    
+             # WAIT FOR REMOTE RESPONSE
+            if(self.waitForRemoteResponse() == 1):
+                return
+            if(n < self.transmission_retries):
+                printMSG("warning", "Timeout waiting for kick response. Issuing retry {} of {}".format(
+                    n + 1, self.transmission_retries))
+
+            n += 1
+
+        # Should not get here unless no response is received.
+        printMSG(
+            "error", "No remote frame received. Check connection to Zeus module.")
+        exit(1)
+
+    def waitForRemoteResponse(self):
+        # WAIT FOR REMOTE RESPONSE
+        sleep(self.remote_timeout)
+        s = time.time()
+        c = time.time()
+        # LOOP HERE UNTIL TIMEOUT EXPIRES
+        while ((c - s) < self.remote_timeout):
+            c = time.time()
+            if(self.r.remote_received() == 1):
+                #  printMSG("debug", "ACK Received.")
+                return 1
+
+    def waitForKickResponse(self):
+        # WAIT FOR REMOTE RESPONSE
+        sleep(self.remote_timeout)
+        s = time.time()
+        c = time.time()
+        # LOOP HERE UNTIL TIMEOUT EXPIRES
+        while ((c - s) < self.remote_timeout):
+            c = time.time()
+            if(self.r.kick_received() == 1):
+                #  printMSG("debug", "ACK Received.")
+                return 1
+
+    def sendDataObject(self, i, cmd_len, data):
+        byte = 0
+        printMSG(
+            "info", "ZeusModule {}: sending data frame {} of {}...".format(self.id, i + 1, cmd_len))
+        printMSG(
+            "debug", "data pre append = {}".format(data.encode('hex')))
+
+        # PAD FRAME WITH ZEROES
+        while(len(data) < 7):
+            data += "0"
+
+        printMSG('debug', "Outstring = {}".format(data))
+        # Assemble the 8th (status) byte
+        # Add EOM bit if this is the last frame of the message.
+        if (i == (cmd_len - 1)):
+            printMSG("debug", "appending EOM bit to byte")
+            byte |= 1 << 7
+        # Add number of data bytes
+        byte |= (len(data[i]) << 4)
+        printMSG("debug", "num data bytes = {}".format(len(data[i])))
+        byte |= ((i + 1) % 31)
+        printMSG("debug", "frame counter = {}".format(((i + 1) % 31)))
+        printMSG("debug", "control byte = {0:b}".format(byte))
+        data += chr(byte)
+        printMSG(
+            "debug", "data post append = {}".format(data.encode('hex')))
+        msg = can.Message(
+            extended_id=False,
+            arbitration_id=self.assembleIdentifier('data'),
+            data=data)
+        try:
+            self.CANBus.send(msg)
+            print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
+        except can.CanError:
+            printMSG("error", "Message not sent!")
+
     def sendCommand(self, cmd):
         data = list(split_by_n(cmd, 7))
         cmd_len = len(data)
-        print(
-            "INFO: ZeusModule {}: sending packet {} in {} data frame(s)...".format(self.id, cmd, cmd_len))
+        printMSG(
+            "info", "ZeusModule {}: sending packet {} in {} data frame(s)...".format(self.id, cmd, cmd_len))
+
+        # Send kick frame and wait for remote response
+        self.sendKickFrame()
         for i in range(0, cmd_len):
             n = 0
-            byte = 0
-            # RETRY UP TO 10 TIMES
-            # SEND KICK FRAME
+            # outstring = bytearray(data[i])
+            outstring = data[i]
+            # sendDataObject(outstring)
             while (n < self.transmission_retries):
-                msg = can.Message(
-                    extended_id=False,
-                        arbitration_id=self.assembleIdentifier('kick'),
-                        data=0
-                )
-                print(
-                    "INFO: ZeusModule {}: sending kick frame...".format(self.id))
-                print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
-                try:
-                    self.CANBus.send(msg)
-                except can.canError:
-                    print(Fore.RED + "ERROR: Kick not sent!" + Style.RESET_ALL)
-                # WAIT FOR REMOTE RESPONSE
-                sleep(self.remote_timeout)
-                s = time.time()
-                c = time.time()
-                # LOOP HERE UNTIL TIMEOUT EXPIRES
-                while ((c - s) < self.remote_timeout):
-                    c = time.time()
-                    if(self.r.remote_received() == 1):
-                        #  print(
-                            # Fore.MAGENTA + "DEBUG: ACK Received." +
-                            # Style.RESET_ALL)
-                        n = self.transmission_retries
-                if(n < self.transmission_retries):
-                    printMSG("warning", "Timeout waiting for kick response. Issuing retry {} of {}".format(
-                        n + 1, self.transmission_retries))
-
-                n += 1
-            #  print(
-                # Fore.MAGENTA + "DEBUG: Jumped out of while loop." +
-                # Style.RESET_ALL)
-
-            n = 0
-            while (n < 10):
                 # SEND DATA FRAME
-                string_length = len(data[i])
-                outstring = bytearray(data[i])
-                # print("INFO: ZeusModule {}: sending data frame {} of
-                # {}...".format(self.id, i+1, cmd_len))
-                #  print(Fore.MAGENTA + "DEBUG: data pre append = {}".format(
-                    #  outstring) + Style.RESET_ALL)
-                printMSG('debug', "data pre append = {}".format(outstring))
-                # Assemble the 8th (status) byte
-                if (i == (cmd_len - 1)):
-                    # Add EOM bit
-                    printMSG("debug","appending EOM bit to byte")
-                    byte |= 1 << 7
-                # Add number of data bytes
-                #byte |= (len(data[i]) << 4)
-                byte |= (string_length << 4)
-                printMSG("debug","num data bytes = {}".format(len(data[i])))
-                byte |= ((i + 1) % 31)
-                printMSG("debug","byte counter = {}".format(((i + 1) % 31)))
-                printMSG("debug","byte = {0:b}".format(byte))
-                outstring.append(byte)
-                printMSG("debug","date post append = {}".format(outstring))
-                msg = can.Message(
-                    extended_id=False,
-                    arbitration_id=self.assembleIdentifier('data'),
-                    data=outstring)
-                print("info","ZeusModule {}: sending data frame {} of {}...".format(self.id, i + 1, cmd_len))
-                print(Fore.GREEN + "{}".format(msg) + Style.RESET_ALL)
-                try:
-                    self.CANBus.send(msg)
-        #          print("Message")
-                except can.canError:
-                    printMSG("error","Message not sent!")
+                self.sendDataObject(i, cmd_len, outstring)
 
                 # WAIT FOR REMOTE RESPONSE
-                s = time.time()
-                c = time.time()
-                # LOOP HERE UNTIL TIMEOUT EXPIRES
-                while ((c - s) < self.remote_timeout):
-                    c = time.time()
-                    if(self.r.remote_received() == 1):
-                        #  print(
-                            # Fore.MAGENTA + "DEBUG: ACK Received." +
-                            # Style.RESET_ALL)
-                        n = self.transmission_retries
+                if(self.waitForRemoteResponse() == 1):
+                   # self.sendRemoteFrame()
+                    printMSG("warning", "just set n=1.")
+                    n = self.transmission_retries
+
                 if(n < self.transmission_retries):
-                    print (Fore.YELLOW + "WARNING: Timeout waiting for kick response. Issuing retry {} of {}".format(
-                        n + 1, self.transmission_retries) + Style.RESET_ALL)
+                    printMSG("warning", "Timeout waiting for remote response. Issuing retry {} of {}".format(
+                        n + 1, self.transmission_retries))
 
                 n += 1
 
@@ -343,7 +455,8 @@ class ZeusModule(object):
         logging.info("ZeusModule {}: initializing CANBus...")
         can.rc['interface'] = 'socketcan_ctypes'
         can.rc['channel'] = 'can0'
-        self.CANBus = can.interface.Bus()
+        self.CANBus = can.interface.Bus(receive_own_messages=False)
+        # self.CANBus = can.interfaces.socketcan_ctypes.SocketcanCtypes_Bus(receive_own_messages=False)
         # self.remoteFrameListener = can.Listener()
         # self.remoteFrameNotifier = can.Notifier(self.CANBus, [self.r])
 
@@ -394,7 +507,7 @@ class ZeusModule(object):
         self.sendCommand(cmd)
 
     def sendString(self, string):
-        #cmd = self.cmdHeader(string)
+        # cmd = self.cmdHeader(string)
         self.sendCommand(string)
 
     def aspiration(self, aspirationVolume=0, containerGeometryTableIndex=0,
@@ -460,9 +573,9 @@ class ZeusModule(object):
         self.sendCommand(cmd)
 
     def getFirmwareVersion(self):
-        #cmd = self.cmdHeader('RF')
+        # cmd = self.cmdHeader('RF')
         self.sendCommand("RFid001")
-        #self.sendCommand(cmd)
+        # self.sendCommand(cmd)
 
     def getParameterValue(self, parameterName):
         if (len(parameterName) > 2):
@@ -567,10 +680,11 @@ class ZeusModule(object):
             'ie' + str(ContainerGeometryParameters.immersionDepth).zfill(4) +\
             'yq' + str(ContainerGeometryParameters.leavingHeight).zfill(4) +\
             'yr' + str(ContainerGeometryParameters.jetHeight).zfill(4) +\
-            'ch' + str(ContainerGeometryParameters.startOfHeightBottomSearch).zfill(4) +\
-            'ci' + \
-                    str(ContainerGeometryParameters.dispenseHeightAfterBottomSearch).zfill(
-                        4)
+            'ch' +\
+            str(ContainerGeometryParameters.startOfHeightBottomSearch).zfill(4) +\
+            'ci' +\
+            str(ContainerGeometryParameters.dispenseHeightAfterBottomSearch).zfill(
+            4)
         self.sendCommand(cmd)
 
     def getContainerGeometryParameters(self, index):
@@ -587,10 +701,11 @@ class ZeusModule(object):
         cmd = self.cmdHeader('GO')
         cmd = cmd + 'go' + str(deckGeometryParameters.index).zfill(2) +\
             'te' + str(deckGeometryParameters.endTraversePosition).zfill(4) +\
-            'tm' + str(deckGeometryParameters.beginningofTipPickingPosition).zfill(4) +\
-            'tr' + \
-                    str(deckGeometryParameters.positionofTipDepositProcess).zfill(
-                        4)
+            'tm' +\
+            str(deckGeometryParameters.beginningofTipPickingPosition).zfill(4) +\
+            'tr' +\
+            str(deckGeometryParameters.positionofTipDepositProcess).zfill(
+            4)
         self.sendCommand(cmd)
 
     def getDeckGeometryParameters(self, index):
@@ -641,11 +756,12 @@ class ZeusModule(object):
         pass
 
     def parseErrors(self, errorString):
-        #  print(Fore.MAGENTA + "DEBUG: ErrorString = {}".format(errorString))
-        #  if len(errorString.replace(" ", "")) == 0:
-            #  return
+        if len(errorString.replace(" ", "")) == 0:
+            return "NONE"
         if errorString == "":
-            return
+            return "NONE"
+
+        printMSG("debug", "ErrorString = {}".format(errorString))
 
         #  else:
             # print(Fore.MAGENTA + "DEBUG: Received error string '{}' with
@@ -655,6 +771,9 @@ class ZeusModule(object):
         cmd = str(errorString[:2])
         # print("cmd = {}".format(cmd))
         eidx = errorString.find("er")
+        if(eidx == -1):
+            return "NONE"
+
         ec = str(errorString[(eidx + 3): (eidx + 5)])
         if ec == '00':
             # NO ERROR

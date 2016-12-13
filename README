@@ -1,0 +1,2 @@
+1.) Run 'sudo ./init_can.sh' to initialize can_bus via 8-devices USB2CAN interface.
+2.) Run 'candump can0' to monitor traffic on can bus while script is running.
